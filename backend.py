@@ -1,11 +1,15 @@
 import json
+import threading
 
 import requests
 from streamcontroller_plugin_tools import BackendBase
 
 from loguru import logger as log
 
-from discordrpc import AsyncDiscord, commands
+from discordrpc import AsyncDiscord, commands, DiscordNotOpened, RPCException, InvalidID
+from discordrpc.constants import MAX_IPC_SOCKET_RANGE
+
+_WATCHDOG_INTERVAL = 3.0  # seconds between reconnection checks
 
 
 class Backend(BackendBase):
@@ -18,10 +22,30 @@ class Backend(BackendBase):
         self.discord_client: AsyncDiscord = None
         self._is_authed: bool = False
         self._current_voice_channel: str = None
-        self._is_reconnecting: bool = False
+        self._reconnecting_lock = threading.Lock()
         self._voice_channel_users: dict = {}  # {user_id: {username, nick, volume, muted}}
         self._current_user_id: str = None  # Current user's ID (for filtering)
         self._current_user_avatar: str = None  # Current user's avatar hash
+        self._watchdog_stop = threading.Event()
+        self._watchdog_thread = threading.Thread(
+            target=self._watchdog_loop, daemon=True, name="discord-watchdog"
+        )
+        self._watchdog_thread.start()
+
+    def _watchdog_loop(self):
+        """Background thread that reconnects to Discord whenever the socket appears."""
+        while not self._watchdog_stop.wait(_WATCHDOG_INTERVAL):
+            if not self.client_id or not self.client_secret:
+                continue
+            if self._reconnecting_lock.locked():
+                continue
+            if self.discord_client is not None and self.discord_client.is_connected():
+                continue
+            # Connection is down; reset auth state and attempt reconnect.
+            # sockets.py will raise DiscordNotOpened if Discord still isn't up;
+            # setup_client() handles that silently so we just retry next interval.
+            self._is_authed = False
+            self.setup_client()
 
     def discord_callback(self, code, event):
         if code == 0:
@@ -93,17 +117,36 @@ class Backend(BackendBase):
         self.frontend.save_refresh_token(refresh_token)
 
     def setup_client(self):
-        if self._is_reconnecting:
+        if not self._reconnecting_lock.acquire(blocking=False):
             log.debug("Already reconnecting, skipping duplicate attempt")
             return
         try:
-            self._is_reconnecting = True
             self.discord_client = AsyncDiscord(self.client_id, self.client_secret)
             self.discord_client.connect(self.discord_callback)
             if not self.access_token:
                 self.discord_client.authorize()
             else:
                 self.discord_client.authenticate(self.access_token)
+        except DiscordNotOpened:
+            # Expected when Discord is not running yet; watchdog will retry.
+            log.debug("Discord not available, watchdog will retry automatically")
+            if self.discord_client:
+                self.discord_client.disconnect()
+            self.discord_client = None
+        except InvalidID as ex:
+            # Wrong client ID is a configuration error, not a transient failure.
+            self.frontend.on_auth_callback(False, str(ex))
+            log.error("failed to setup discord client: {0}", ex)
+            if self.discord_client:
+                self.discord_client.disconnect()
+            self.discord_client = None
+        except RPCException:
+            # Discord accepted the socket but hasn't responded yet (still starting up).
+            # The watchdog will retry automatically.
+            log.debug("Discord not ready yet (no RPC response), watchdog will retry")
+            if self.discord_client:
+                self.discord_client.disconnect()
+            self.discord_client = None
         except Exception as ex:
             self.frontend.on_auth_callback(False, str(ex))
             log.error("failed to setup discord client: {0}", ex)
@@ -111,7 +154,7 @@ class Backend(BackendBase):
                 self.discord_client.disconnect()
             self.discord_client = None
         finally:
-            self._is_reconnecting = False
+            self._reconnecting_lock.release()
 
     def update_client_credentials(
         self,
@@ -142,7 +185,7 @@ class Backend(BackendBase):
     def _ensure_connected(self) -> bool:
         """Ensure client is connected, trigger reconnection if needed."""
         if self.discord_client is None or not self.discord_client.is_connected():
-            if not self._is_reconnecting:
+            if not self._reconnecting_lock.locked():
                 self.setup_client()
             return False
         return True

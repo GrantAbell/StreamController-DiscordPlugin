@@ -47,18 +47,20 @@ class AsyncDiscord:
                 self.rpc.connect()
                 break
             except Exception as ex:
-                log.error(f"failed to connect to socket. {ex}")
+                log.debug(f"failed to connect to socket. {ex}")
                 tries += 1
+        else:
+            raise DiscordNotOpened
 
         self.rpc.send({"v": "1", "client_id": self.client_id}, OP_HANDSHAKE)
         code, resp = self.rpc.receive()
 
         if not resp:
-            log.error("no response from discord client")
+            log.debug("no response from discord client")
             raise RPCException
 
         if code == SOCKET_BAD_BUFFER_SIZE:
-            log.error("bad buffer size when receiving data from socket")
+            log.debug("bad buffer size when receiving data from socket")
             raise RPCException
 
         try:

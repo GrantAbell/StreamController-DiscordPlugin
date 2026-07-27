@@ -103,6 +103,9 @@ class ChangeVoiceChannel(DiscordCore):
         self._guild_id: str = None
         self._guild_name: str = None
         self._guild_icon_image: Image.Image = None
+        self._guild_icon_url: str | None = None  # last known icon URL, for retry
+        self._fetching_guild_icon: bool = False  # in-flight guard (mirrors _fetching_avatars)
+        self._guild_request_pending: bool = False  # GET_GUILD request in flight (avoid spam)
         self._guild_channel_id: str = None
         self._channel_name: str = None  # Current channel name for label display
 
@@ -177,10 +180,18 @@ class ChangeVoiceChannel(DiscordCore):
         self._startup_sync_attempts += 1
 
         configured_channel = self._channel_row.get_value()
-        if configured_channel:
+        # Wait for both the configured channel value AND backend authentication.
+        # is_connected() flips true after the socket handshake but BEFORE Discord
+        # accepts AUTHENTICATE — any subscribe/get_channel sent in that window is
+        # silently dropped, leaving voice_states empty until the user interacts.
+        backend_ready = (
+            self.backend is not None
+            and getattr(self.backend, "is_authed", lambda: False)()
+        )
+        if configured_channel and backend_ready:
             self._start_watching_configured_channel()
 
-            if self.backend and not self._requested_initial_voice_state:
+            if not self._requested_initial_voice_state:
                 self.backend.request_current_voice_channel()
                 self._requested_initial_voice_state = True
 
@@ -188,7 +199,8 @@ class ChangeVoiceChannel(DiscordCore):
             self._startup_sync_source_id = None
             return False
 
-        if self._startup_sync_attempts >= 40:
+        # Allow up to ~30s for auth to complete (token refresh, network hiccups).
+        if self._startup_sync_attempts >= 120:
             self._startup_sync_source_id = None
             return False
         return True
@@ -274,8 +286,15 @@ class ChangeVoiceChannel(DiscordCore):
                 self._render_button()
         else:
             # Re-subscribe to voice states for the configured channel (Discord dropped
-            # the subscription when we left).  This also fetches a fresh GET_CHANNEL.
+            # the subscription when we left). Always fetch a fresh user list too —
+            # _start_watching_configured_channel may return early if _watching_channel_id
+            # was set pre-auth (startup timing race), leaving voice_states never populated.
             self._start_watching_configured_channel()
+            if self._watching_channel_id:
+                try:
+                    self.backend.get_channel(self._watching_channel_id)
+                except Exception as ex:
+                    log.error(f"Failed to refresh user list in observer mode: {ex}")
             self._render_button()  # Immediate render while waiting for GET_CHANNEL reply
 
     # Voice state events (join/leave) — used only as refresh triggers
@@ -367,51 +386,83 @@ class ChangeVoiceChannel(DiscordCore):
         # Guild info lookup (only if not yet cached for this channel)
         if self._guild_channel_id != channel_id:
             guild_id = data.get("guild_id")
+            # New guild context — drop any stale icon/url so we don't display or
+            # retry the previous server's thumbnail.
+            self._guild_icon_image = None
+            self._guild_icon_url = None
             if not guild_id:
                 self._guild_id = None
                 self._guild_channel_id = channel_id
-                self._guild_icon_image = None
                 self._guild_name = data.get("name", "")
             else:
                 self._guild_id = guild_id
                 self._guild_channel_id = channel_id
-                try:
-                    self.backend.get_guild(guild_id)
-                except Exception as ex:
-                    log.error(f"Failed to request guild info: {ex}")
+                self._request_guild_info()
 
         self._render_button()
+
+    def _request_guild_info(self):
+        """Issue a GET_GUILD lookup for the current guild, guarded against spamming."""
+        if not self.backend or not self._guild_id or self._guild_request_pending:
+            return
+        self._guild_request_pending = True
+        try:
+            self.backend.get_guild(self._guild_id)
+        except Exception as ex:
+            log.error(f"Failed to request guild info: {ex}")
+            self._guild_request_pending = False
 
     def _on_get_guild(self, *args, **kwargs):
         data = args[1] if len(args) > 1 else None
         if not data or data.get("id") != self._guild_id:
             return
+        # The GET_GUILD reply landed; clear the pending flag so a fresh lookup can
+        # be issued later if needed.
+        self._guild_request_pending = False
         self._guild_name = data.get("name", "")
         icon_url = data.get("icon_url")
         if icon_url:
-            try:
-                self.plugin_base._thread_pool.submit(self._fetch_guild_icon, icon_url)
-            except Exception as ex:
-                log.error(f"Failed to submit guild icon fetch task: {ex}")
-                self._fetch_guild_icon(icon_url)
+            self._guild_icon_url = icon_url
+            self._submit_guild_icon_fetch()
         else:
+            self._guild_icon_url = None
             self._guild_icon_image = None
             self._render_button()
 
-    def _fetch_guild_icon(self, icon_url: str):
-        image_bytes = None
+    def _submit_guild_icon_fetch(self):
+        """Submit a guild-icon fetch if not already cached or in-flight.
+
+        Mirrors _submit_avatar_fetch so the icon self-heals: a transient CDN/network
+        failure (common when StreamController boots before the network is ready) leaves
+        _guild_icon_image None, and the next _render_button re-submits this fetch.
+        """
+        if not self.backend or not self._guild_icon_url:
+            return
+        if self._guild_icon_image is not None or self._fetching_guild_icon:
+            return
+        self._fetching_guild_icon = True
         try:
-            image_bytes = self.backend.fetch_guild_icon(icon_url)
+            self.plugin_base._thread_pool.submit(self._fetch_guild_icon)
+        except Exception as ex:
+            log.error(f"Failed to submit guild icon fetch task: {ex}")
+            self._fetch_guild_icon()
+
+    def _fetch_guild_icon(self):
+        try:
+            image_bytes = self.backend.fetch_guild_icon(self._guild_icon_url)
+            if image_bytes:
+                try:
+                    self._guild_icon_image = Image.open(io.BytesIO(image_bytes)).convert("RGBA")
+                except Exception as ex:
+                    log.error(f"Failed to decode guild icon: {ex}")
+                    self._guild_icon_image = None
+            else:
+                # Leave _guild_icon_image None so the next render retries the fetch.
+                self._guild_icon_image = None
         except Exception as ex:
             log.error(f"Failed to fetch guild icon: {ex}")
-        if image_bytes:
-            try:
-                self._guild_icon_image = Image.open(io.BytesIO(image_bytes)).convert("RGBA")
-            except Exception as ex:
-                log.error(f"Failed to decode guild icon: {ex}")
-                self._guild_icon_image = None
-        else:
-            self._guild_icon_image = None
+        finally:
+            self._fetching_guild_icon = False
         self._render_button()
 
     # Avatar fetching
@@ -453,6 +504,15 @@ class ChangeVoiceChannel(DiscordCore):
         # Ensure configured-channel metadata and subscriptions are loaded even if
         # initial auth/state events were missed during startup ordering.
         self._start_watching_configured_channel()
+
+        # Self-heal the guild thumbnail. If we know the guild but the icon is still
+        # missing, retry — either the CDN download (URL known) or the GET_GUILD lookup
+        # itself (URL never arrived). Both helpers are guarded so this cannot spam.
+        if self._guild_id and self._guild_icon_image is None:
+            if self._guild_icon_url:
+                self._submit_guild_icon_fetch()
+            else:
+                self._request_guild_info()
 
         configured = self._channel_row.get_value()
         connected = (
@@ -678,6 +738,9 @@ class ChangeVoiceChannel(DiscordCore):
                 pass
         self._guild_channel_id = None
         self._guild_icon_image = None
+        self._guild_icon_url = None
+        self._fetching_guild_icon = False
+        self._guild_request_pending = False
         self._guild_name = None
         self._guild_id = None
         self._channel_name = None

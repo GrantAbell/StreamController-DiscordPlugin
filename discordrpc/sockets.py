@@ -26,33 +26,36 @@ class UnixPipe:
             self.disconnect()
         self.socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.socket.settimeout(SOCKET_CONNECT_TIMEOUT)
-        base_path = path = (
+        runtime_dir = re.sub(r"\/$", "", (
             os.environ.get("XDG_RUNTIME_DIR")
             or os.environ.get("TMPDIR")
             or os.environ.get("TMP")
             or os.environ.get("TEMP")
             or "/tmp"
-        )
-        base_path = re.sub(r"\/$", "", path) + "/discord-ipc-{0}"
-        for i in range(MAX_IPC_SOCKET_RANGE):
-            path = base_path.format(i)
-            try:
-                log.debug(f"Attempting to connect to socket at path: {path}")
-                self.socket.connect(path)
-                break
-            except FileNotFoundError:
-                log.warning(f"socket {path} not found, trying next socket.")
-                pass
-            except Exception as ex:
-                log.error(
-                    f"failed to connect to socket {path}, trying next socket. {ex}"
-                )
-                # Skip all errors to try all sockets
-                pass
-        else:
-            raise DiscordNotOpened
-        log.debug(f"Connected to socket at path: {path}")
-        self.socket.setblocking(False)
+        ))
+        # Try standard XDG path first, then Discord Flatpak app-specific path.
+        # The Flatpak path handles cases where both apps are Flatpaks and the
+        # portal proxy for the SC sandbox hasn't been set up yet.
+        base_paths = [
+            runtime_dir + "/discord-ipc-{0}",
+            runtime_dir + "/app/com.discordapp.Discord/discord-ipc-{0}",
+        ]
+        for base_path in base_paths:
+            for i in range(MAX_IPC_SOCKET_RANGE):
+                path = base_path.format(i)
+                try:
+                    log.debug(f"Attempting to connect to socket at path: {path}")
+                    self.socket.connect(path)
+                    log.debug(f"Connected to socket at path: {path}")
+                    self.socket.setblocking(False)
+                    return
+                except FileNotFoundError:
+                    log.debug(f"socket {path} not found, trying next socket.")
+                except Exception as ex:
+                    log.debug(
+                        f"failed to connect to socket {path}, trying next socket. {ex}"
+                    )
+        raise DiscordNotOpened
 
     def disconnect(self):
         if self.socket is None:
