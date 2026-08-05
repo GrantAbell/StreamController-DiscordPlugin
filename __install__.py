@@ -9,11 +9,22 @@ create_venv(join(toplevel, ".venv"), join(
 # Grant the StreamController Flatpak live access to the Discord app runtime
 # directory so it can find the Discord IPC socket even when Discord starts
 # after StreamController.
-subprocess.run(
-    [
-        "flatpak", "override", "--user",
-        "--filesystem=xdg-run/app/com.discordapp.Discord",
-        "com.core447.StreamController",
-    ],
-    check=False,
-)
+#
+# This script runs *inside* the StreamController Flatpak sandbox, where there is
+# no `flatpak` binary and no way to modify host config directly. Route the
+# command through `flatpak-spawn --host` so it runs on the host, and never let a
+# failure here abort the (already-completed) venv install: it's a best-effort
+# convenience, and `flatpak-spawn` is absent when running outside a sandbox.
+try:
+    subprocess.run(
+        [
+            "flatpak-spawn", "--host",
+            "flatpak", "override", "--user",
+            "--filesystem=xdg-run/app/com.discordapp.Discord",
+            "com.core447.StreamController",
+        ],
+        check=False,
+        timeout=30,
+    )
+except (FileNotFoundError, subprocess.SubprocessError):
+    pass
