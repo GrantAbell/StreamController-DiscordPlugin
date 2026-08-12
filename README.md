@@ -1,6 +1,6 @@
 > [!NOTE]
-> Only the official Discord application is currently supported. Alternate clients may not work, and
-> unfortunately I don't have the capacity to troubleshoot at the moment.
+> Fork of [ImDevinC](https://github.com/ImDevinC/)'s original archived plugin, with some enrichment to the existing actions.
+> Only Official Discord Client Supported. 
 
 > [!WARNING]
 > Vesktop **will not** work with this plugin. This is an issue with Vesktop, and not something I can fix
