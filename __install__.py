@@ -10,6 +10,15 @@ create_venv(join(toplevel, ".venv"), join(
 # directory so it can find the Discord IPC socket even when Discord starts
 # after StreamController.
 #
+# The `:create` suffix is what makes "even when Discord starts after
+# StreamController" actually hold. Flatpak resolves this grant once, while the
+# sandbox is built: without `:create` it skips the mount whenever the directory
+# does not exist yet, and the socket then stays invisible for the whole life of
+# the process. With `:create` flatpak makes the directory itself before binding
+# it, so Discord's socket shows up live the moment Discord creates it.
+# Keep in sync with DISCORD_RUNTIME_GRANT in discordrpc/flatpak.py, which this
+# script cannot import because it runs before the plugin venv exists.
+#
 # This script runs *inside* the StreamController Flatpak sandbox, where there is
 # no `flatpak` binary and no way to modify host config directly. Route the
 # command through `flatpak-spawn --host` so it runs on the host, and never let a
@@ -20,7 +29,7 @@ try:
         [
             "flatpak-spawn", "--host",
             "flatpak", "override", "--user",
-            "--filesystem=xdg-run/app/com.discordapp.Discord",
+            "--filesystem=xdg-run/app/com.discordapp.Discord:create",
             "com.core447.StreamController",
         ],
         check=False,

@@ -8,7 +8,8 @@ import select
 from loguru import logger as log
 
 from .exceptions import DiscordNotOpened
-from .constants import MAX_IPC_SOCKET_RANGE, SOCKET_SELECT_TIMEOUT, SOCKET_BUFFER_SIZE
+from .constants import MAX_IPC_SOCKET_RANGE, SOCKET_SELECT_TIMEOUT, HEADER_SIZE
+from .flatpak import DISCORD_FLATPAK_ID, diagnose_unreachable_socket
 
 SOCKET_DISCONNECTED: int = -1
 SOCKET_BAD_BUFFER_SIZE: int = -2
@@ -34,11 +35,12 @@ class UnixPipe:
             or "/tmp"
         ))
         # Try standard XDG path first, then Discord Flatpak app-specific path.
-        # The Flatpak path handles cases where both apps are Flatpaks and the
-        # portal proxy for the SC sandbox hasn't been set up yet.
+        # When Discord is a Flatpak the former is only a symlink to the latter,
+        # so both resolve to the same socket -- but the symlink dangles if
+        # Discord's runtime directory was never mounted into our sandbox.
         base_paths = [
             runtime_dir + "/discord-ipc-{0}",
-            runtime_dir + "/app/com.discordapp.Discord/discord-ipc-{0}",
+            runtime_dir + f"/app/{DISCORD_FLATPAK_ID}/discord-ipc-{{0}}",
         ]
         for base_path in base_paths:
             for i in range(MAX_IPC_SOCKET_RANGE):
@@ -55,6 +57,7 @@ class UnixPipe:
                     log.debug(
                         f"failed to connect to socket {path}, trying next socket. {ex}"
                     )
+        diagnose_unreachable_socket(runtime_dir)
         raise DiscordNotOpened
 
     def disconnect(self):
@@ -78,17 +81,36 @@ class UnixPipe:
         self.socket.settimeout(SOCKET_SEND_TIMEOUT)
         self.socket.sendall(message)
 
+    def _recv_exactly(self, count: int) -> bytes:
+        """Read exactly count bytes, or b"" if the peer closed the connection.
+
+        A stream socket hands back whatever has arrived so far, which is
+        routinely less than a whole frame: Discord's Flatpak reaches us through
+        a socat relay that forwards in 8 KiB blocks, so any larger response --
+        GET_CHANNEL for a busy voice channel, say -- lands in pieces. Reading
+        once would truncate the JSON *and* leave the remainder queued to be
+        misread as the next frame's header, desynchronising the stream until
+        the next reconnect.
+        """
+        buffer = b""
+        while len(buffer) < count:
+            chunk = self.socket.recv(count - len(buffer))
+            if not chunk:
+                return b""
+            buffer += chunk
+        return buffer
+
     def receive(self) -> (int, str):
-        data = self.socket.recv(SOCKET_BUFFER_SIZE)
-        if len(data) == 0:
+        header = self._recv_exactly(HEADER_SIZE)
+        if not header:
             return SOCKET_DISCONNECTED, {}
-        header = data[:8]
         code = int.from_bytes(header[:4], "little")
         length = int.from_bytes(header[4:], "little")
-        all_data = b""
         if length < 0:
             return SOCKET_BAD_BUFFER_SIZE, {}
-        if length > 0:
-            data = self.socket.recv(length)
-            all_data += data
-        return code, all_data.decode("UTF-8")
+        if length == 0:
+            return code, ""
+        payload = self._recv_exactly(length)
+        if not payload:
+            return SOCKET_DISCONNECTED, {}
+        return code, payload.decode("UTF-8")

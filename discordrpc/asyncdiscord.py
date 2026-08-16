@@ -90,10 +90,15 @@ class AsyncDiscord:
             except Exception as ex:
                 log.error(f"error receiving data from socket. {ex}")
                 self.disconnect()
+                break
+            # Sentinel codes carry no payload, so passing them to the callback
+            # only ever produced a "failed to parse discord event" error.
             if val[0] == SOCKET_BAD_BUFFER_SIZE:
                 log.debug("bad buffer size when receiving data from socket")
+                continue
             if val[0] == SOCKET_DISCONNECTED:
                 self.disconnect()
+                break
             callback(val[0], val[1])
 
     def authorize(self):
