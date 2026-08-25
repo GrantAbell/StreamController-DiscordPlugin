@@ -24,10 +24,15 @@ from .actions.UserVolume import UserVolume
 
 # Import event IDs
 from .discordrpc.commands import (
-    VOICE_CHANNEL_SELECT, VOICE_SETTINGS_UPDATE,
-    GET_CHANNEL, GET_GUILD,
-    SPEAKING_START, SPEAKING_STOP,
-    VOICE_STATE_CREATE, VOICE_STATE_DELETE, VOICE_STATE_UPDATE,
+    VOICE_CHANNEL_SELECT,
+    VOICE_SETTINGS_UPDATE,
+    GET_CHANNEL,
+    GET_GUILD,
+    SPEAKING_START,
+    SPEAKING_STOP,
+    VOICE_STATE_CREATE,
+    VOICE_STATE_DELETE,
+    VOICE_STATE_UPDATE,
 )
 
 
@@ -127,18 +132,19 @@ class PluginTemplate(PluginBase):
             event_id_suffix=VOICE_STATE_UPDATE,
         )
 
-        self.add_event_holders([
-            voice_channel_select,
-            voice_settings_update,
-            get_channel,
-            get_guild,
-            speaking_start,
-            speaking_stop,
-            voice_state_create,
-            voice_state_delete,
-            voice_state_update,
-        ])
-
+        self.add_event_holders(
+            [
+                voice_channel_select,
+                voice_settings_update,
+                get_channel,
+                get_guild,
+                speaking_start,
+                speaking_stop,
+                voice_state_create,
+                voice_state_delete,
+                voice_state_update,
+            ]
+        )
 
     def _add_icons(self):
         self.add_icon("main", self.get_asset_path("Discord-Symbol-Blurple.png"))

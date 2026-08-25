@@ -1,5 +1,5 @@
 {
-  "version": "1.12.0",
+  "version": "2.0.0",
   "thumbnail": "store/thumbnail.png",
   "id": "com_grantabell_StreamControllerDiscordPlugin",
   "name": "Discord",
@@ -9,7 +9,7 @@
     "discord"
   ],
   "minimum-app-version": "1.5.0-beta.10",
-  "app-version": "1.5.0-beta.15",
+  "app-version": "1.5.0-beta.16",
   "description": "Adds controls for Discord including mute, deafen, and change channel",
   "short-description": "Control Discord"
 }
