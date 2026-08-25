@@ -106,6 +106,7 @@ class ChangeVoiceChannel(DiscordCore):
         self._guild_icon_url: str | None = None  # last known icon URL, for retry
         self._fetching_guild_icon: bool = False  # in-flight guard (mirrors _fetching_avatars)
         self._guild_request_pending: bool = False  # GET_GUILD request in flight (avoid spam)
+        self._guild_info_id: str = None  # guild whose GET_GUILD reply we already have
         self._guild_channel_id: str = None
         self._channel_name: str = None  # Current channel name for label display
 
@@ -417,8 +418,9 @@ class ChangeVoiceChannel(DiscordCore):
         if not data or data.get("id") != self._guild_id:
             return
         # The GET_GUILD reply landed; clear the pending flag so a fresh lookup can
-        # be issued later if needed.
+        # be issued later if needed, and record that this guild is now answered.
         self._guild_request_pending = False
+        self._guild_info_id = self._guild_id
         self._guild_name = data.get("name", "")
         icon_url = data.get("icon_url")
         if icon_url:
@@ -507,11 +509,16 @@ class ChangeVoiceChannel(DiscordCore):
 
         # Self-heal the guild thumbnail. If we know the guild but the icon is still
         # missing, retry — either the CDN download (URL known) or the GET_GUILD lookup
-        # itself (URL never arrived). Both helpers are guarded so this cannot spam.
+        # itself (no reply yet).
+        #
+        # That second retry must not fire once GET_GUILD has answered: a server with
+        # no icon answers icon_url=None forever, and _on_get_guild re-renders, so
+        # asking again here would loop us at RPC round-trip speed. _guild_request_pending
+        # does not stop it — the reply clears the flag before the re-render.
         if self._guild_id and self._guild_icon_image is None:
             if self._guild_icon_url:
                 self._submit_guild_icon_fetch()
-            else:
+            elif self._guild_info_id != self._guild_id:
                 self._request_guild_info()
 
         configured = self._channel_row.get_value()
@@ -741,6 +748,7 @@ class ChangeVoiceChannel(DiscordCore):
         self._guild_icon_url = None
         self._fetching_guild_icon = False
         self._guild_request_pending = False
+        self._guild_info_id = None
         self._guild_name = None
         self._guild_id = None
         self._channel_name = None
