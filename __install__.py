@@ -34,6 +34,9 @@ try:
         ],
         check=False,
         timeout=30,
+        # The portal chdir()s into our working directory on the host, so it has
+        # to name a path that exists out there too.
+        cwd="/",
     )
 except (FileNotFoundError, subprocess.SubprocessError):
     pass

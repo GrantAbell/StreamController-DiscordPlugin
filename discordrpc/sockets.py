@@ -9,7 +9,11 @@ from loguru import logger as log
 
 from .exceptions import DiscordNotOpened
 from .constants import MAX_IPC_SOCKET_RANGE, SOCKET_SELECT_TIMEOUT, HEADER_SIZE
-from .flatpak import DISCORD_FLATPAK_ID, diagnose_unreachable_socket
+from .flatpak import (
+    DISCORD_FLATPAK_ID,
+    diagnose_unreachable_socket,
+    note_socket_connected,
+)
 
 SOCKET_DISCONNECTED: int = -1
 SOCKET_BAD_BUFFER_SIZE: int = -2
@@ -49,6 +53,7 @@ class UnixPipe:
                     log.debug(f"Attempting to connect to socket at path: {path}")
                     self.socket.connect(path)
                     log.debug(f"Connected to socket at path: {path}")
+                    note_socket_connected()
                     self.socket.setblocking(False)
                     return
                 except FileNotFoundError:
