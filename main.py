@@ -3,7 +3,7 @@ import json
 from concurrent.futures import ThreadPoolExecutor
 
 from loguru import logger as log
-from gi.repository import Gtk
+from gi.repository import Gtk, GLib
 
 # Import StreamController modules
 from src.backend.PluginManager.PluginBase import PluginBase
@@ -24,6 +24,7 @@ from .actions.UserVolume import UserVolume
 
 # Import event IDs
 from .discordrpc.commands import (
+    AUTHENTICATE,
     VOICE_CHANNEL_SELECT,
     VOICE_SETTINGS_UPDATE,
     GET_CHANNEL,
@@ -34,6 +35,11 @@ from .discordrpc.commands import (
     VOICE_STATE_DELETE,
     VOICE_STATE_UPDATE,
 )
+
+
+# launch_backend() is asynchronous; wait up to 30s for the process to register.
+_BACKEND_WAIT_INTERVAL_MS = 250
+_BACKEND_WAIT_MAX_ATTEMPTS = 120
 
 
 class PluginTemplate(PluginBase):
@@ -84,9 +90,15 @@ class PluginTemplate(PluginBase):
         )
 
         self.add_css_stylesheet(os.path.join(self.PATH, "style.css"))
+        self._backend_wait_attempts = 0
         self.setup_backend()
 
     def _create_event_holders(self):
+        authenticated = EventHolder(
+            plugin_base=self,
+            event_id_suffix=AUTHENTICATE,
+        )
+
         voice_channel_select = EventHolder(
             plugin_base=self,
             event_id_suffix=VOICE_CHANNEL_SELECT,
@@ -134,6 +146,7 @@ class PluginTemplate(PluginBase):
 
         self.add_event_holders(
             [
+                authenticated,
                 voice_channel_select,
                 voice_settings_update,
                 get_channel,
@@ -237,7 +250,21 @@ class PluginTemplate(PluginBase):
         self.add_action_holder(user_volume)
 
     def setup_backend(self):
-        if not self.backend:
+        if self.backend is None:
+            # launch_backend() returns before the backend process has registered,
+            # so this can run before there is anything to hand credentials to.
+            # Nothing else calls setup_backend() and the backend cannot ask, so
+            # without a retry it sits with no client id for good -- its watchdog
+            # skipping every tick in silence -- and the only way to recover is
+            # re-authorising by hand in the plugin settings.
+            if self._backend_wait_attempts < _BACKEND_WAIT_MAX_ATTEMPTS:
+                self._backend_wait_attempts += 1
+                GLib.timeout_add(_BACKEND_WAIT_INTERVAL_MS, self._retry_setup_backend)
+            else:
+                log.error(
+                    "backend did not come up; Discord credentials were never "
+                    "delivered, so the plugin cannot connect"
+                )
             return
         if self.backend.is_authed():
             return
@@ -253,6 +280,10 @@ class PluginTemplate(PluginBase):
             access_token,
             refresh_token,
         )
+
+    def _retry_setup_backend(self) -> bool:
+        self.setup_backend()
+        return False  # one-shot; setup_backend() reschedules if still too early
 
     def save_access_token(self, access_token: str):
         settings = self.get_settings()

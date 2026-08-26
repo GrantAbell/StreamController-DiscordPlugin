@@ -93,6 +93,12 @@ class Backend(BackendBase):
                 self._current_user_id = user.get("id")
                 self._current_user_avatar = user.get("avatar")
                 self._get_current_voice_channel()
+                # Tell the actions the connection is usable. Everything they set up
+                # -- subscriptions, channel and guild lookups -- is per-connection
+                # and was lost with the old socket, and until now nothing told them
+                # a new one had arrived. An action that gave up waiting during a slow
+                # or re-authenticated start had no way back.
+                self.frontend.trigger_event(commands.AUTHENTICATE, data)
             case commands.DISPATCH:
                 evt = event.get("evt")
                 self.frontend.trigger_event(evt, event.get("data"))
@@ -117,6 +123,11 @@ class Backend(BackendBase):
         self.frontend.save_refresh_token(refresh_token)
 
     def setup_client(self):
+        if not self.client_id or not self.client_secret:
+            # Actions call this through _ensure_connected() before credentials have
+            # been delivered. Handshaking with a null client id only ever earns
+            # "Invalid ID" from Discord and a spurious auth-failed callback.
+            return
         if not self._reconnecting_lock.acquire(blocking=False):
             log.debug("Already reconnecting, skipping duplicate attempt")
             return

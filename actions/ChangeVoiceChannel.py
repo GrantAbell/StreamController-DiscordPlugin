@@ -20,6 +20,7 @@ from GtkHelper.GenerativeUI.SpinRow import SpinRow
 from gi.repository import GLib  # type: ignore[attr-defined]
 
 from ..discordrpc.commands import (
+    AUTHENTICATE,
     VOICE_CHANNEL_SELECT,
     GET_CHANNEL,
     GET_GUILD,
@@ -131,6 +132,10 @@ class ChangeVoiceChannel(DiscordCore):
         super().on_ready()
         if not self._events_connected:
             self.plugin_base.connect_to_event(
+                event_id=f"{self.plugin_base.get_plugin_id()}::{AUTHENTICATE}",
+                callback=self._on_authenticated,
+            )
+            self.plugin_base.connect_to_event(
                 event_id=f"{self.plugin_base.get_plugin_id()}::{VOICE_CHANNEL_SELECT}",
                 callback=self._on_voice_channel_select,
             )
@@ -169,6 +174,21 @@ class ChangeVoiceChannel(DiscordCore):
 
         # Start a short-lived retry loop so startup ordering (settings/backend/auth)
         # does not leave the action without initial guild/channel state.
+        self._schedule_startup_sync()
+
+    def _on_authenticated(self, *args, **kwargs):
+        """Rebuild everything that belonged to the previous connection.
+
+        Subscriptions live on the Discord socket, so a reconnect silently drops
+        them, and the cached ids below would otherwise convince
+        _start_watching_configured_channel() there was nothing left to do. Clearing
+        them makes the next sync re-subscribe and re-fetch from scratch.
+        """
+        self._watching_channel_id = None
+        self._guild_channel_id = None
+        self._guild_info_id = None
+        self._guild_request_pending = False
+        self._requested_initial_voice_state = False
         self._schedule_startup_sync()
 
     def _schedule_startup_sync(self):
@@ -406,6 +426,11 @@ class ChangeVoiceChannel(DiscordCore):
         """Issue a GET_GUILD lookup for the current guild, guarded against spamming."""
         if not self.backend or not self._guild_id or self._guild_request_pending:
             return
+        # Discord rejects RPC commands sent before AUTHENTICATE has come back, and
+        # _render_button reaches here without waiting for it. Asking early only
+        # ever earns an error reply, so hold off; the next render retries.
+        if not getattr(self.backend, "is_authed", lambda: False)():
+            return
         self._guild_request_pending = True
         try:
             self.backend.get_guild(self._guild_id)
@@ -415,11 +440,16 @@ class ChangeVoiceChannel(DiscordCore):
 
     def _on_get_guild(self, *args, **kwargs):
         data = args[1] if len(args) > 1 else None
+        # Clear the in-flight flag for *any* reply, before deciding whether this one
+        # is ours. Discord answers a rejected lookup with {"code", "message"} and no
+        # "id" — commonly 4003, not authenticated — and returning with the flag still
+        # set wedges the action permanently: _request_guild_info() bails out early
+        # from then on, so the button never gets its server name and only editing the
+        # channel ID clears it.
+        self._guild_request_pending = False
         if not data or data.get("id") != self._guild_id:
             return
-        # The GET_GUILD reply landed; clear the pending flag so a fresh lookup can
-        # be issued later if needed, and record that this guild is now answered.
-        self._guild_request_pending = False
+        # This guild is now answered; _render_button stops asking.
         self._guild_info_id = self._guild_id
         self._guild_name = data.get("name", "")
         icon_url = data.get("icon_url")

@@ -21,7 +21,6 @@ class DiscordCore(ActionCore):
         self.current_color: Color = None
         self.icon_name: str = ""
         self.color_name: str = ""
-        self.backend: "Backend" = self.plugin_base.backend
 
         # Track registered callbacks for cleanup
         self._registered_callbacks: list[tuple[str, callable]] = []
@@ -31,6 +30,26 @@ class DiscordCore(ActionCore):
 
         self.create_generative_ui()
         self.create_event_assigners()
+
+    @property
+    def backend(self):
+        """The plugin's backend, read live rather than snapshotted.
+
+        launch_backend() is asynchronous, so actions built during startup can be
+        constructed before the backend process has registered. Capturing it in
+        __init__ left whichever action won that race with a working reference and
+        the others holding None for the rest of their lives -- no channel lookup,
+        no server name, no thumbnail, and no way back short of recreating the
+        action. The first key on a page is the usual loser.
+
+        ActionCore assigns this too (only ever None, at __init__ and on teardown),
+        so the setter has to exist; an explicit non-None assignment would win.
+        """
+        return getattr(self, "_backend_override", None) or self.plugin_base.backend
+
+    @backend.setter
+    def backend(self, value):
+        self._backend_override = value
 
     def on_ready(self):
         super().on_ready()
