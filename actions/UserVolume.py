@@ -21,6 +21,7 @@ from ..discordrpc.commands import (
     VOICE_STATE_CREATE,
     VOICE_STATE_DELETE,
     VOICE_STATE_UPDATE,
+    VOICE_SETTINGS_UPDATE,
     VOICE_CHANNEL_SELECT,
     GET_CHANNEL,
     SPEAKING_START,
@@ -53,10 +54,12 @@ class UserVolume(DiscordCore):
         self._in_voice_channel: bool = False
         self._speaking: set = set()          # user_ids currently speaking
         self._fetching_avatars: set = set()  # user_ids with in-flight avatar fetches
-        self._self_input_volume: int = 100   # Tracked locally; mic input volume is write-only via RPC
+        self._self_input_volume: int = 100   # Synced from VOICE_SETTINGS_UPDATE
+        self._self_muted: bool = False       # Synced from VOICE_SETTINGS_UPDATE
         self._label_cache: dict[str, str] = {"top": "", "center": "", "bottom": ""}
         self._events_connected: bool = False
         self._requested_initial_voice_state: bool = False
+        self._warned_missing_user_id: bool = False
 
         # Volume adjustment step (percentage points per dial tick)
         self.VOLUME_STEP = 5
@@ -116,6 +119,10 @@ class UserVolume(DiscordCore):
                 callback=self._on_voice_state_update,
                 )
             self.plugin_base.connect_to_event(
+                event_id=f"{self.plugin_base.get_plugin_id()}::{VOICE_SETTINGS_UPDATE}",
+                callback=self._on_voice_settings_update,
+                )
+            self.plugin_base.connect_to_event(
                 event_id=f"{self.plugin_base.get_plugin_id()}::{SPEAKING_START}",
                 callback=self._on_speaking_start,
                 )
@@ -131,6 +138,7 @@ class UserVolume(DiscordCore):
         # Request current voice channel state (in case we're already in a channel)
         if self.backend and not self._requested_initial_voice_state:
             self.backend.request_current_voice_channel()
+            self.backend.request_voice_settings()
             self._requested_initial_voice_state = True
 
     def create_event_assigners(self):
@@ -212,6 +220,8 @@ class UserVolume(DiscordCore):
                 if not self.backend.set_user_mute(user["id"], new_muted):
                     return
             user["muted"] = new_muted
+            if user.get("is_self"):
+                self._self_muted = new_muted
             self._update_display()
         except Exception as ex:
             log.error(f"Failed to toggle mute for {user['id']}: {ex}")
@@ -265,7 +275,8 @@ class UserVolume(DiscordCore):
                 self._current_user_index = 0
                 self._speaking.clear()
                 self._fetching_avatars.clear()
-                self._self_input_volume = 100
+                # Mic volume and self-mute are global voice settings, not
+                # per-channel state -- leave them to VOICE_SETTINGS_UPDATE.
                 self.backend.clear_voice_channel_users()
             else:
                 # Joined voice channel
@@ -279,7 +290,6 @@ class UserVolume(DiscordCore):
                     self._current_user_index = 0
                     self._speaking.clear()
                     self._fetching_avatars.clear()
-                    self._self_input_volume = 100
 
                 self._in_voice_channel = True
                 self._current_channel_id = new_channel_id
@@ -327,6 +337,16 @@ class UserVolume(DiscordCore):
             else None
         )
 
+        if not current_user_id and not self._warned_missing_user_id:
+            # Without it every "is this me?" test answers no, so the local user
+            # is treated as an ordinary participant and the dial locally mutes
+            # them instead of muting the microphone.
+            log.warning(
+                "Discord has not identified the current user; the self entry "
+                "cannot be tagged and mic control will not work"
+            )
+            self._warned_missing_user_id = True
+
         existing = {u["id"]: u for u in self._users}
         snapshot: dict[str, dict] = {}
         arrival_order: list[str] = []
@@ -345,11 +365,14 @@ class UserVolume(DiscordCore):
                     continue
                 user_info = existing.get(user_id) or {
                     "id": user_id,
-                    "volume": self._self_input_volume,
-                    "muted": False,
                     "avatar_img": None,
                     "is_self": True,
                 }
+                # Self's mute and volume come from voice settings, never from
+                # the voice state (whose mute/volume are what *we* applied to
+                # another user), so they are always taken from the synced copy.
+                user_info["volume"] = self._self_input_volume
+                user_info["muted"] = self._self_muted
                 user_info["username"] = user_data.get("username", "Me")
                 user_info["nick"] = vs.get("nick")
                 user_info["avatar_hash"] = (
@@ -451,6 +474,34 @@ class UserVolume(DiscordCore):
                 break
 
         self._update_display()
+
+    def _on_voice_settings_update(self, *args, **kwargs):
+        """Sync our own mute state and mic volume from Discord's voice settings.
+
+        The dial cannot infer either one. SET_VOICE_SETTINGS is a blind write,
+        and VOICE_STATE_UPDATE's mute/volume are the local overrides we apply to
+        *other* users, so they are deliberately ignored for self. Without this,
+        the entry sat at its seeded "unmuted" value: a mute toggled anywhere else
+        (Discord's UI, a hotkey, the Mute action) inverted the dial's idea of the
+        state, and the next press re-sent the mute it thought it was setting --
+        a no-op that looked like the dial had stopped working.
+        """
+        data = args[1] if len(args) > 1 else None
+        if not data:
+            return
+
+        # Deafened implies muted, matching how the Mute action reports it
+        self._self_muted = bool(data.get("mute")) or bool(data.get("deaf"))
+        volume = (data.get("input") or {}).get("volume")
+        if volume is not None:
+            self._self_input_volume = max(0, min(100, round(volume)))
+
+        for user in self._users:
+            if user.get("is_self"):
+                user["muted"] = self._self_muted
+                user["volume"] = self._self_input_volume
+                self._update_display()
+                break
 
     # === Speaking ===
 

@@ -38,6 +38,7 @@ class AsyncDiscord:
         return self.polling
 
     def connect(self, callback: callable):
+        self.ready_user = {}
         tries = 0
         while tries < MAX_SOCKET_RETRY_ATTEMPTS:
             try:
@@ -72,6 +73,10 @@ class AsyncDiscord:
             raise InvalidID
         if data.get("cmd") != "DISPATCH" or data.get("evt") != "READY":
             raise RPCException
+        # READY carries the logged-in user. It arrives before the polling thread
+        # exists, so discord_callback never sees this frame -- keep the user here
+        # or the identity is lost for the life of the connection.
+        self.ready_user = (data.get("data") or {}).get("user") or {}
         self.polling = True
         threading.Thread(target=self.poll_callback, args=[callback]).start()
 

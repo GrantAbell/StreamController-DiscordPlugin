@@ -90,9 +90,9 @@ class Backend(BackendBase):
                 data = event.get("data", {})
                 user = data.get("user", {})
                 self._register_callbacks()
-                self._current_user_id = user.get("id")
-                self._current_user_avatar = user.get("avatar")
+                self._adopt_current_user(user, source="AUTHENTICATE")
                 self._get_current_voice_channel()
+                self._get_voice_settings()
                 # Tell the actions the connection is usable. Everything they set up
                 # -- subscriptions, channel and guild lookups -- is per-connection
                 # and was lost with the old socket, and until now nothing told them
@@ -111,10 +111,37 @@ class Backend(BackendBase):
                     commands.VOICE_CHANNEL_SELECT,
                     {"channel_id": channel_id},
                 )
+            case commands.GET_VOICE_SETTINGS:
+                # Same payload shape as the VOICE_SETTINGS_UPDATE dispatch, so the
+                # actions get their initial mute/deafen/PTT/input-volume state over
+                # the one path they already listen on. Discord only dispatches that
+                # event on a *change*, so without this reply everything tracking
+                # voice settings starts out guessing (and guessing "off").
+                self.frontend.trigger_event(
+                    commands.VOICE_SETTINGS_UPDATE, event.get("data")
+                )
             case commands.GET_CHANNEL:
                 self.frontend.trigger_event(commands.GET_CHANNEL, event.get("data"))
             case commands.GET_GUILD:
                 self.frontend.trigger_event(commands.GET_GUILD, event.get("data"))
+
+    def _adopt_current_user(self, user: dict | None, source: str = ""):
+        """Record the logged-in user, keeping whatever we already resolved.
+
+        Both the READY handshake and the AUTHENTICATE reply can name the user,
+        and either may omit it, so neither is allowed to clear a known value.
+        """
+        user = user or {}
+        user_id = user.get("id")
+        if user_id:
+            self._current_user_id = user_id
+        avatar = user.get("avatar")
+        if avatar:
+            self._current_user_avatar = avatar
+        log.info(
+            f"current user after {source}: id={self._current_user_id} "
+            f"(this frame supplied id={user_id!r})"
+        )
 
     def _update_tokens(self, access_token: str = "", refresh_token: str = ""):
         self.access_token = access_token
@@ -134,6 +161,15 @@ class Backend(BackendBase):
         try:
             self.discord_client = AsyncDiscord(self.client_id, self.client_secret)
             self.discord_client.connect(self.discord_callback)
+            # Discord names the logged-in user in the READY handshake. The
+            # AUTHENTICATE reply does not always carry a user object, and when it
+            # didn't, _current_user_id stayed None -- which silently turned every
+            # "is this me?" test into a no. UserVolume then treated the local user
+            # as an ordinary participant and locally muted them (inaudible) instead
+            # of muting the microphone.
+            self._adopt_current_user(
+                getattr(self.discord_client, "ready_user", None), source="READY"
+            )
             if not self.access_token:
                 self.discord_client.authorize()
             else:
@@ -264,6 +300,16 @@ class Backend(BackendBase):
     def request_current_voice_channel(self):
         """Public method to request current voice channel state (dispatches to callbacks)."""
         self._get_current_voice_channel()
+
+    def _get_voice_settings(self):
+        if not self._ensure_connected():
+            log.warning("Discord client not connected, cannot get voice settings")
+            return
+        self.discord_client.get_voice_settings()
+
+    def request_voice_settings(self):
+        """Public method to request current voice settings (dispatches to callbacks)."""
+        self._get_voice_settings()
 
     # User volume control methods
 
