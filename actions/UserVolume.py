@@ -297,12 +297,17 @@ class UserVolume(DiscordCore):
             log.error(f"UserVolume[{id(self)}]: Error in _on_voice_channel_select: {ex}")
 
     def _on_get_channel(self, *args, **kwargs):
-        """Handle GET_CHANNEL response with initial user list."""
+        """Rebuild the user list from a GET_CHANNEL snapshot.
+
+        This is the only authoritative source of who is in our channel, so the
+        list is reconciled against it rather than patched from the voice-state
+        events, which carry no channel_id (see _on_voice_state_create).
+        """
         data = args[1]
         if not data:
             return
 
-        # Check if this is for our current channel
+        # Other actions fetch their own channels over the shared connection.
         channel_id = data.get("id")
         if channel_id != self._current_channel_id:
             return
@@ -311,132 +316,115 @@ class UserVolume(DiscordCore):
         if data.get("name"):
             self._current_channel_name = data.get("name")
 
-        # Process voice_states array
         voice_states = data.get("voice_states", [])
         current_user_id = self.backend.current_user_id
         control_self = self._control_self_row.get_value()
 
-        # Remove stale is_self entry if the toggle was turned off
-        if not control_self:
-            self._users = [u for u in self._users if not u.get("is_self")]
-            if self._current_user_index >= len(self._users):
-                self._current_user_index = max(0, len(self._users) - 1)
+        # Remember who the dial points at so the selection survives the rebuild
+        selected_id = (
+            self._users[self._current_user_index]["id"]
+            if self._current_user_index < len(self._users)
+            else None
+        )
+
+        existing = {u["id"]: u for u in self._users}
+        snapshot: dict[str, dict] = {}
+        arrival_order: list[str] = []
 
         for vs in voice_states:
             user_data = vs.get("user", {})
             user_id = user_data.get("id")
 
-            if not user_id:
+            if not user_id or user_id in snapshot:
                 continue
 
-            # Self: inject as first entry when the toggle is enabled
+            # Self: included only when the toggle is enabled, and its volume is
+            # the locally tracked mic input, not the voice-state output volume.
             if user_id == current_user_id:
-                if control_self and not any(u.get("is_self") for u in self._users):
-                    self_info = {
-                        "id": user_id,
-                        "username": user_data.get("username", "Me"),
-                        "nick": vs.get("nick"),
-                        "volume": self._self_input_volume,
-                        "muted": False,
-                        "avatar_hash": user_data.get("avatar") or self.backend.current_user_avatar,
-                        "avatar_img": None,
-                        "is_self": True,
-                    }
-                    self._users.insert(0, self_info)
-                    self._submit_avatar_fetch(user_id)
-                continue
+                if not control_self:
+                    continue
+                user_info = existing.get(user_id) or {
+                    "id": user_id,
+                    "volume": self._self_input_volume,
+                    "muted": False,
+                    "avatar_img": None,
+                    "is_self": True,
+                }
+                user_info["username"] = user_data.get("username", "Me")
+                user_info["nick"] = vs.get("nick")
+                user_info["avatar_hash"] = (
+                    user_data.get("avatar") or self.backend.current_user_avatar
+                )
+            else:
+                user_info = existing.get(user_id) or {
+                    "id": user_id,
+                    "avatar_img": None,
+                }
+                user_info["username"] = user_data.get("username", "Unknown")
+                user_info["nick"] = vs.get("nick")
+                user_info["volume"] = vs.get("volume", 100)
+                user_info["muted"] = vs.get("mute", False)
+                user_info["avatar_hash"] = user_data.get("avatar")
 
-            user_info = {
-                "id": user_id,
-                "username": user_data.get("username", "Unknown"),
-                "nick": vs.get("nick"),
-                "volume": vs.get("volume", 100),
-                "muted": vs.get("mute", False),
-                "avatar_hash": user_data.get("avatar"),
-                "avatar_img": None,
-            }
+                # Update backend cache
+                self.backend.update_voice_channel_user(
+                    user_id,
+                    user_info["username"],
+                    user_info["nick"],
+                    user_info["volume"],
+                    user_info["muted"]
+                )
 
-            # Add if not already present (idempotent)
-            if not any(u["id"] == user_id for u in self._users):
-                self._users.append(user_info)
-                self._submit_avatar_fetch(user_id)
+            snapshot[user_id] = user_info
+            arrival_order.append(user_id)
 
-            # Update backend cache
-            self.backend.update_voice_channel_user(
-                user_id,
-                user_info["username"],
-                user_info["nick"],
-                user_info["volume"],
-                user_info["muted"]
-            )
+        # Keep the established display order, append anyone new, and float self
+        # to the front (sort is stable, so the rest keeps its order).
+        users = [snapshot[u["id"]] for u in self._users if u["id"] in snapshot]
+        kept = {u["id"] for u in users}
+        users.extend(snapshot[uid] for uid in arrival_order if uid not in kept)
+        users.sort(key=lambda u: not u.get("is_self"))
 
-        self._update_display()
+        # Drop everyone who is no longer in the channel
+        for user_id in existing.keys() - snapshot.keys():
+            self._speaking.discard(user_id)
+            self._fetching_avatars.discard(user_id)
+            self.backend.remove_voice_channel_user(user_id)
 
-    def _on_voice_state_create(self, *args, **kwargs):
-        """Handle user joining voice channel."""
-        data = args[1] if len(args) > 1 else None
-        if not data:
-            return
-
-        user_data = data.get("user", {})
-        user_id = user_data.get("id")
-        if not user_id:
-            return
-
-        # Filter out self
-        if user_id == self.backend.current_user_id:
-            return
-
-        user_info = {
-            "id": user_id,
-            "username": user_data.get("username", "Unknown"),
-            "nick": data.get("nick"),
-            "volume": data.get("volume", 100),
-            "muted": data.get("mute", False),
-            "avatar_hash": user_data.get("avatar"),
-            "avatar_img": None,
-        }
-
-        # Add to local list (avoid duplicates)
-        if not any(u["id"] == user_id for u in self._users):
-            self._users.append(user_info)
-            self._submit_avatar_fetch(user_id)
-
-        # Update backend cache
-        self.backend.update_voice_channel_user(
-            user_id,
-            user_info["username"],
-            user_info["nick"],
-            user_info["volume"],
-            user_info["muted"]
+        self._users = users
+        self._current_user_index = next(
+            (i for i, u in enumerate(self._users) if u["id"] == selected_id), 0
         )
 
+        for user in self._users:
+            if user.get("avatar_img") is None:
+                self._submit_avatar_fetch(user["id"])
+
         self._update_display()
+
+    # Discord's VOICE_STATE_CREATE/DELETE data contains no channel_id, and the
+    # events are broadcast to every action, so a join in a channel some other
+    # button watches is indistinguishable from a join in ours. Use them only as
+    # a signal to re-fetch GET_CHANNEL for the channel we are actually in and
+    # let _on_get_channel reconcile from the authoritative voice_states array.
+
+    def _on_voice_state_create(self, *args, **kwargs):
+        """Handle a user joining a subscribed voice channel."""
+        self._request_channel_refresh()
 
     def _on_voice_state_delete(self, *args, **kwargs):
-        """Handle user leaving voice channel."""
-        data = args[1] if len(args) > 1 else None
-        if not data:
+        """Handle a user leaving a subscribed voice channel."""
+        self._request_channel_refresh()
+
+    def _request_channel_refresh(self):
+        if not self._in_voice_channel or not self._current_channel_id:
             return
-
-        user_data = data.get("user", {})
-        user_id = user_data.get("id")
-        if not user_id:
+        if not self.backend:
             return
-
-        # Remove from local list
-        self._users = [u for u in self._users if u["id"] != user_id]
-        self._speaking.discard(user_id)
-        self._fetching_avatars.discard(user_id)
-
-        # Adjust current index if needed
-        if self._current_user_index >= len(self._users):
-            self._current_user_index = max(0, len(self._users) - 1)
-
-        # Update backend cache
-        self.backend.remove_voice_channel_user(user_id)
-
-        self._update_display()
+        try:
+            self.backend.get_channel(self._current_channel_id)
+        except Exception as ex:
+            log.error(f"Failed to refresh channel on voice state change: {ex}")
 
     def _on_voice_state_update(self, *args, **kwargs):
         """Handle user voice state change (volume, mute, etc)."""
